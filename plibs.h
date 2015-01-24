@@ -28,11 +28,12 @@
 #ifndef _PSYNC_LIBS_H
 #define _PSYNC_LIBS_H
 
-#include <sqlite3.h>
-
 #include "pcompiler.h"
 #include "pcompat.h"
 #include "psynclib.h"
+
+#include <sqlite3.h>
+#include <string.h>
 
 #define D_NONE     0
 #define D_BUG      10
@@ -86,9 +87,39 @@
 #if D_WARNING<=DEBUG_LEVEL
 #define likely_log(x) (likely(x)?1:psync_debug(__FILE__, __FUNCTION__, __LINE__, D_WARNING, "assertion likely_log(%s) failed", TO_STR(x))*0)
 #define unlikely_log(x) (unlikely(x)?psync_debug(__FILE__, __FUNCTION__, __LINE__, D_WARNING, "assertion unlikely_log(%s) failed", TO_STR(x)):0)
+#if defined(PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP)
+#undef PTHREAD_MUTEX_INITIALIZER
+#define PTHREAD_MUTEX_INITIALIZER PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
+#endif
+#define pthread_mutex_lock(mutex) \
+  do {\
+    int __mutex_result=pthread_mutex_lock(mutex);\
+    if (unlikely(__mutex_result)){\
+      debug(D_CRITICAL, "pthread_mutex_lock returned %d", __mutex_result);\
+      abort();\
+    }\
+  } while (0)
+#define pthread_mutex_unlock(mutex) \
+  do {\
+    int __mutex_result=pthread_mutex_unlock(mutex);\
+    if (unlikely(__mutex_result)){\
+      debug(D_CRITICAL, "pthread_mutex_unlock returned %d", __mutex_result);\
+      abort();\
+    }\
+  } while (0)
+#define PRINT_RETURN(x) ((x)*psync_debug(__FILE__, __FUNCTION__, __LINE__, D_NOTICE, "returning %d", (int)(x)))
+#define PRINT_RETURN_CONST(x) ((x)*psync_debug(__FILE__, __FUNCTION__, __LINE__, D_NOTICE, "returning " #x))
+#define PRINT_RETURN_FORMAT(x, format, ...) ((x)*psync_debug(__FILE__, __FUNCTION__, __LINE__, D_NOTICE, "returning %d" format, (int)(x), __VA_ARGS__))
+#define PRINT_NEG_RETURN(x) ((x<0)?(x)*psync_debug(__FILE__, __FUNCTION__, __LINE__, D_WARNING, "returning %d", (int)(x)):(x))
+#define PRINT_NEG_RETURN_FORMAT(x, format, ...) ((x<0)?(x)*psync_debug(__FILE__, __FUNCTION__, __LINE__, D_WARNING, "returning %d "  format, (int)(x), __VA_ARGS__):(x))
 #else
 #define likely_log likely
 #define unlikely_log unlikely
+#define PRINT_RETURN(x) (x)
+#define PRINT_RETURN_CONST(x) (x)
+#define PRINT_RETURN_FORMAT(x, format, ...) (x)
+#define PRINT_NEG_RETURN(x) (x)
+#define PRINT_NEG_RETURN_FORMAT(x, format, ...) (x)
 #endif
 
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof((arr)[0]))
@@ -123,6 +154,7 @@ typedef struct {
   sqlite3_stmt *stmt;
   const char *sql;
   int column_count;
+  int locked;
   psync_variant row[];
 } psync_sql_res;
 
@@ -156,6 +188,7 @@ extern uint64_t psync_my_userid;
 extern pthread_mutex_t psync_my_auth_mutex;
 extern PSYNC_THREAD uint32_t psync_error;
 extern uint16_t const *__hex_lookup;
+extern const char base64_table[];
 
 char *psync_strdup(const char *str) PSYNC_MALLOC PSYNC_NONNULL(1);
 char *psync_strnormalize_filename(const char *str) PSYNC_MALLOC PSYNC_NONNULL(1);
@@ -176,6 +209,11 @@ void psync_sql_checkpoint_unlock();
 int psync_sql_trylock();
 void psync_sql_lock();
 void psync_sql_unlock();
+void psync_sql_rdlock();
+void psync_sql_rdunlock();
+int psync_sql_has_waiters();
+int psync_sql_isrdlocked();
+int psync_sql_tryupgradelock();
 int psync_sql_sync();
 int psync_sql_start_transaction();
 int psync_sql_commit_transaction();
@@ -188,6 +226,10 @@ char **psync_sql_rowstr(const char *sql) PSYNC_NONNULL(1);
 psync_variant *psync_sql_row(const char *sql) PSYNC_NONNULL(1);
 psync_sql_res *psync_sql_query(const char *sql) PSYNC_NONNULL(1);
 psync_sql_res *psync_sql_query_nocache(const char *sql) PSYNC_NONNULL(1);
+psync_sql_res *psync_sql_query_rdlock(const char *sql) PSYNC_NONNULL(1);
+psync_sql_res *psync_sql_query_rdlock_nocache(const char *sql) PSYNC_NONNULL(1);
+psync_sql_res *psync_sql_query_nolock(const char *sql) PSYNC_NONNULL(1);
+psync_sql_res *psync_sql_query_nolock_nocache(const char *sql) PSYNC_NONNULL(1);
 psync_sql_res *psync_sql_prep_statement(const char *sql) PSYNC_NONNULL(1);
 psync_sql_res *psync_sql_prep_statement_nocache(const char *sql) PSYNC_NONNULL(1);
 void psync_sql_reset(psync_sql_res *res) PSYNC_NONNULL(1);
@@ -238,5 +280,17 @@ uint64_t psync_err_number_expected(const char *file, const char *function, int u
 const char *psync_err_string_expected(const char *file, const char *function, int unsigned line, const psync_variant *v) PSYNC_COLD;
 const char *psync_lstring_expected(const char *file, const char *function, int unsigned line, const psync_variant *v, size_t *len) PSYNC_NONNULL(4, 5);
 double psync_err_real_expected(const char *file, const char *function, int unsigned line, const psync_variant *v) PSYNC_COLD;
+
+/* needs 12 characters of buffer space on top of the length of the prefix */
+static inline void psync_get_string_id(char *dst, const char *prefix, uint64_t id){
+  size_t plen;
+  plen=strlen(prefix);
+  dst=(char *)memcpy(dst, prefix, plen)+plen;
+  do{
+    *dst++=base64_table[id%64];
+    id/=64;
+  } while (id);
+  *dst=0;
+}
 
 #endif

@@ -109,7 +109,7 @@ static psync_socket *get_connected_socket(){
   psync_sql_res *q;
   char *device;
   uint64_t result, userid, luserid;
-  int saveauth;
+  int saveauth, isbusiness;
   auth=user=pass=NULL;
   while (1){
     psync_free(auth);
@@ -258,12 +258,24 @@ static psync_socket *get_connected_socket(){
       psync_sql_bind_string(q, 1, "lastname");
       psync_sql_bind_string(q, 2, psync_find_result(cres, "lastname", PARAM_STR)->str);
       psync_sql_run(q);
+      isbusiness=1;
     }
     else{
       psync_sql_bind_string(q, 1, "business");
       psync_sql_bind_uint(q, 2, 0);
       psync_sql_run(q);
+      isbusiness=0;
     }
+    psync_sql_bind_string(q, 1, "cryptosetup");
+    psync_sql_bind_uint(q, 2, psync_find_result(res, "cryptosetup", PARAM_BOOL)->num);
+    psync_sql_run(q);
+    psync_sql_bind_string(q, 1, "cryptosubscription");
+    psync_sql_bind_uint(q, 2, psync_find_result(res, "cryptosubscription", PARAM_BOOL)->num);
+    psync_sql_run(q);
+    cres=psync_check_result(res, "cryptoexpires", PARAM_NUM);
+    psync_sql_bind_string(q, 1, "cryptoexpires");
+    psync_sql_bind_uint(q, 2, cres?cres->num:0);
+    psync_sql_run(q);
     psync_sql_free_result(q);
     psync_sql_commit_transaction();
     pthread_mutex_lock(&psync_my_auth_mutex);
@@ -281,7 +293,7 @@ static psync_socket *get_connected_socket(){
     else
       psync_sql_statement("DELETE FROM setting WHERE id IN ('pass', 'auth')");
     psync_free(res);
-    if (cres){
+    if (isbusiness){
       binparam params[]={P_STR("timeformat", "timestamp"), 
                          P_STR("auth", psync_my_auth)};
       res=send_command(sock, "account_info", params);
@@ -1078,7 +1090,7 @@ void psync_diff_delete_folder(const binresult *meta){
 }
 
 static void process_modifyuserinfo(const binresult *entry){
-  const binresult *res;
+  const binresult *res, *cres;
   psync_sql_res *q;
   uint64_t u;
   if (!entry)
@@ -1111,6 +1123,19 @@ static void process_modifyuserinfo(const binresult *entry){
   psync_sql_run(q);
   psync_sql_bind_string(q, 1, "language");
   psync_sql_bind_string(q, 2, psync_find_result(res, "language", PARAM_STR)->str);
+  psync_sql_run(q);
+  u=psync_find_result(res, "cryptosetup", PARAM_BOOL)->num;
+  psync_sql_bind_string(q, 1, "cryptosetup");
+  psync_sql_bind_uint(q, 2, u);
+  psync_sql_run(q);
+  if (!u)
+    psync_crypto_stop();
+  psync_sql_bind_string(q, 1, "cryptosubscription");
+  psync_sql_bind_uint(q, 2, psync_find_result(res, "cryptosubscription", PARAM_BOOL)->num);
+  psync_sql_run(q);
+  cres=psync_check_result(res, "cryptoexpires", PARAM_NUM);
+  psync_sql_bind_string(q, 1, "cryptoexpires");
+  psync_sql_bind_uint(q, 2, cres?cres->num:0);
   psync_sql_run(q);
   psync_sql_free_result(q);
   psync_send_eventid(PEVENT_USERINFO_CHANGED);
@@ -1617,6 +1642,76 @@ static void psync_diff_refresh_fs(const binresult *entries){
   }
 }
 
+static void psync_run_analyze_if_needed(){
+  if (psync_timer_time()>psync_sql_cellint("SELECT value FROM setting WHERE id='lastanalyze'", 0)+24*3600){
+    static const char *skiptables[]={"pagecache", "sqlite_stat1"};
+    psync_sql_res *res;
+    psync_uint_row row;
+    psync_str_row srow;
+    char **tablenames;
+    char *sql;
+    size_t tablecnt, i;
+    debug(D_NOTICE, "running ANALYZE on tables");
+    res=psync_sql_query_rdlock("SELECT COUNT(*) FROM sqlite_master WHERE type='table'");
+    if ((row=psync_sql_fetch_rowint(res)))
+      tablecnt=row[0];
+    else
+      tablecnt=0;
+    psync_sql_free_result(res);
+    tablenames=psync_new_cnt(char *, tablecnt);
+    res=psync_sql_query_rdlock("SELECT name FROM sqlite_master WHERE type='table' LIMIT ?");
+    psync_sql_bind_uint(res, 1, tablecnt);
+    tablecnt=0;
+    while ((srow=psync_sql_fetch_rowstr(res))){
+      for (i=0; i<ARRAY_SIZE(skiptables); i++)
+        if (!strcmp(srow[0], skiptables[i]))
+          goto skip;
+      tablenames[tablecnt++]=psync_strdup(srow[0]);
+      skip:;
+    }
+    psync_sql_free_result(res);
+    
+    while (tablecnt){
+      --tablecnt;
+      debug(D_NOTICE, "running ANALYZE on %s", tablenames[tablecnt]);
+      sql=psync_strcat("ANALYZE ", tablenames[tablecnt], ";", NULL);
+      psync_free(tablenames[tablecnt]);
+      psync_sql_statement(sql);
+      psync_free(sql);
+      debug(D_NOTICE, "table done");
+      psync_milisleep(5);
+    }
+    psync_free(tablenames);
+    res=psync_sql_prep_statement("REPLACE INTO setting (id, value) VALUES (?, ?)");
+    psync_sql_bind_string(res, 1, "lastanalyze");
+    psync_sql_bind_uint(res, 2, psync_timer_time());
+    psync_sql_run_free(res);
+    debug(D_NOTICE, "done running ANALYZE on tables");
+  }
+}
+
+static int psync_diff_check_quota(psync_socket *sock){
+  binparam diffparams[]={P_STR("timeformat", "timestamp")};
+  binresult *res;
+  uint64_t oused_quota, result;
+  oused_quota=used_quota;
+  res=send_command(sock, "userinfo", diffparams);
+  if (!res)
+    return -1;
+  result=psync_find_result(res, "result", PARAM_NUM)->num;
+  if (unlikely(result))
+    debug(D_WARNING, "userinfo returned error %u: %s", (unsigned)result, psync_find_result(res, "error", PARAM_STR)->str);
+  else
+    used_quota=psync_find_result(res, "usedquota", PARAM_NUM)->num;
+  if (used_quota!=oused_quota){
+    debug(D_WARNING, "corrected locally calculated quota from %lu to %lu", (unsigned long)oused_quota, (unsigned long)used_quota);
+    psync_set_uint_value("usedquota", used_quota);
+    psync_send_eventid(PEVENT_USEDQUOTA_CHANGED);
+  }
+  psync_free(res);
+  return 0;
+}
+
 static void psync_diff_thread(){
   psync_socket *sock;
   binresult *res;
@@ -1665,11 +1760,15 @@ restart:
     psync_free(res);
   } while (result);
   debug(D_NOTICE, "initial sync finished");
+  if (psync_diff_check_quota(sock)){
+    psync_socket_close(sock);
+    psync_milisleep(PSYNC_SLEEP_BEFORE_RECONNECT);
+    goto restart;
+  }
   check_overquota();
   psync_set_status(PSTATUS_TYPE_ONLINE, PSTATUS_ONLINE_ONLINE);
   initialdownload=0;
   psync_syncer_check_delayed_syncs();
-  psync_sql_statement("ANALYZE");
   exceptionsock=setup_exeptions();
   if (unlikely(exceptionsock==INVALID_SOCKET)){
     debug(D_ERROR, "could not create pipe");
@@ -1679,6 +1778,8 @@ restart:
   socks[0]=exceptionsock;
   socks[1]=sock->sock;
   send_diff_command(sock, diffid);
+  psync_milisleep(50);
+  psync_run_analyze_if_needed();
   while (psync_do_run){
     if (psync_socket_pendingdata(sock))
       sel=1;
@@ -1715,8 +1816,9 @@ restart:
         if (entries->length){
           newdiffid=psync_find_result(res, "diffid", PARAM_NUM)->num;
           diffid=process_entries(entries, newdiffid);
-          check_overquota();
           psync_diff_refresh_fs(entries);
+          psync_diff_check_quota(sock);
+          check_overquota();
         }
         else
           debug(D_NOTICE, "diff with 0 entries, did we send a nop recently?");

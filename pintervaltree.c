@@ -60,7 +60,7 @@ static psync_interval_tree_t *psync_interval_tree_consume_intervals(psync_interv
 
 static psync_interval_tree_t *psync_interval_tree_get_add(psync_interval_tree_t *tree, uint64_t from, uint64_t to){
 //  debug(D_NOTICE, "adding interval %lu %lu", from, to);
-  assert(to>=from);
+  assert(to>from);
   if (unlikely(!tree))
     return psync_interval_tree_new(from, to);
   else{
@@ -104,9 +104,26 @@ void psync_interval_tree_add(psync_interval_tree_t **tree, uint64_t from, uint64
 }
 
 void psync_interval_tree_free(psync_interval_tree_t *tree){
-  if (!tree)
-    return;
-  psync_interval_tree_free(psync_interval_tree_element(tree->tree.left));
-  psync_interval_tree_free(psync_interval_tree_element(tree->tree.right));
-  psync_free(tree);
+  if (tree)
+    psync_tree_for_each_element_call_safe(&tree->tree, psync_interval_tree_t, tree, psync_free);
+}
+
+static psync_interval_tree_t *psync_interval_tree_get_cut_end(psync_interval_tree_t *tree, uint64_t end){
+  psync_interval_tree_t *last, *prev;
+  last=psync_interval_tree_get_last(tree);
+  while (last && last->to>end){
+    if (last->from<end){
+      last->to=end;
+      break;
+    }
+    prev=psync_interval_tree_get_prev(last);
+    tree=psync_interval_tree_element(psync_tree_get_del(&tree->tree, &last->tree));
+    psync_free(last);
+    last=prev;
+  }
+  return tree;
+}
+
+void psync_interval_tree_cut_end(psync_interval_tree_t **tree, uint64_t end){
+  *tree=psync_interval_tree_get_cut_end(*tree, end);
 }

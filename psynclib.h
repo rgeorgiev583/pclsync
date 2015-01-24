@@ -58,6 +58,7 @@ typedef struct {
   uint8_t cansyncup;
   uint8_t cansyncdown;
   uint8_t canshare;
+  uint8_t isencrypted;
 } pfolder_t;
 
 typedef struct {
@@ -103,6 +104,8 @@ typedef struct {
 #define PSTATUS_USER_MISMATCH          14
 
 typedef struct {
+  const char *downloadstr; /* formatted string with the status of uploads */
+  const char *uploadstr;   /* formatted string with the status of downloads */
   uint64_t bytestoupload; /* sum of the sizes of files that need to be uploaded to sync state */
   uint64_t bytestouploadcurrent; /* sum of the sizes of files in filesuploading */
   uint64_t bytesuploaded; /* bytes uploaded in files accounted in filesuploading */
@@ -202,6 +205,55 @@ typedef struct {
 
 #define PSYNC_PERM_ALL (PSYNC_PERM_READ|PSYNC_PERM_CREATE|PSYNC_PERM_MODIFY|PSYNC_PERM_DELETE)
 #define PSYNC_PERM_WRITE (PSYNC_PERM_CREATE|PSYNC_PERM_MODIFY|PSYNC_PERM_DELETE)
+
+#define PSYNC_CRYPTO_SETUP_SUCCESS       0
+#define PSYNC_CRYPTO_SETUP_NOT_SUPPORTED -1
+#define PSYNC_CRYPTO_SETUP_KEYGEN_FAILED 1
+#define PSYNC_CRYPTO_SETUP_CANT_CONNECT  2
+#define PSYNC_CRYPTO_SETUP_NOT_LOGGED_IN 3
+#define PSYNC_CRYPTO_SETUP_ALREADY_SETUP 4
+#define PSYNC_CRYPTO_SETUP_UNKNOWN_ERROR 5
+
+#define PSYNC_CRYPTO_START_SUCCESS         0
+#define PSYNC_CRYPTO_START_NOT_SUPPORTED   -1
+#define PSYNC_CRYPTO_START_ALREADY_STARTED 1 
+#define PSYNC_CRYPTO_START_CANT_CONNECT    2
+#define PSYNC_CRYPTO_START_NOT_LOGGED_IN   3
+#define PSYNC_CRYPTO_START_NOT_SETUP       4
+#define PSYNC_CRYPTO_START_UNKNOWN_KEY_FORMAT 5
+#define PSYNC_CRYPTO_START_BAD_PASSWORD    6
+#define PSYNC_CRYPTO_START_KEYS_DONT_MATCH 7
+#define PSYNC_CRYPTO_START_UNKNOWN_ERROR   8
+
+#define PSYNC_CRYPTO_STOP_SUCCESS          0
+#define PSYNC_CRYPTO_STOP_NOT_SUPPORTED    -1
+#define PSYNC_CRYPTO_STOP_NOT_STARTED      1
+
+#define PSYNC_CRYPTO_HINT_SUCCESS          0
+#define PSYNC_CRYPTO_HINT_NOT_SUPPORTED    -1
+#define PSYNC_CRYPTO_HINT_NOT_PROVIDED     1
+#define PSYNC_CRYPTO_HINT_CANT_CONNECT     2
+#define PSYNC_CRYPTO_HINT_NOT_LOGGED_IN    3
+#define PSYNC_CRYPTO_HINT_UNKNOWN_ERROR    4
+
+#define PSYNC_CRYPTO_RESET_SUCCESS         0
+#define PSYNC_CRYPTO_RESET_CRYPTO_IS_STARTED 1
+#define PSYNC_CRYPTO_RESET_CANT_CONNECT    2
+#define PSYNC_CRYPTO_RESET_NOT_LOGGED_IN   3
+#define PSYNC_CRYPTO_RESET_NOT_SETUP       4
+#define PSYNC_CRYPTO_RESET_UNKNOWN_ERROR   5
+
+#define PSYNC_CRYPTO_SUCCESS               0
+#define PSYNC_CRYPTO_NOT_STARTED           -1
+#define PSYNC_CRYPTO_RSA_ERROR             -2
+#define PSYNC_CRYPTO_FOLDER_NOT_FOUND      -3
+#define PSYNC_CRYPTO_FILE_NOT_FOUND        -4
+#define PSYNC_CRYPTO_INVALID_KEY           -5
+#define PSYNC_CRYPTO_CANT_CONNECT          -6
+#define PSYNC_CRYPTO_FOLDER_NOT_ENCRYPTED  -7
+#define PSYNC_CRYPTO_INTERNAL_ERROR        -8
+
+#define PSYNC_CRYPTO_INVALID_FOLDERID      ((psync_folderid_t)-1)
 
 typedef struct {
   const char *localname;
@@ -562,6 +614,7 @@ const char *psync_get_auth_string();
  * fscachesize (uint) - size of filesystem cache, in bytes, sane minimum of few tens of Mb or even hundreds is advised
  * fsroot (string) - where to mount the filesystem
  * autostartfs (bool) - if set starts the fs on app startup
+ * sleepstopcrypto (bool) - if set, stops crypto when computer wakes up from sleep
  * 
  *
  * The following functions operate on settings. The value of psync_get_string_setting does not have to be freed, however if you are
@@ -742,6 +795,74 @@ int psync_fs_isstarted();
 void psync_fs_stop();
 char *psync_fs_getmountpoint();
 char *psync_fs_get_path_by_folderid(psync_folderid_t folderid);
+
+
+/* psync_password_quality estimates password quality, returns one of:
+ *   0 - weak
+ *   1 - moderate
+ *   2 - strong
+ */
+
+int psync_password_quality(const char *password);
+
+/* psync_password_quality10000 works the same way as psync_password_quality but for each password strength also return
+ * a range, returns integer in one of the following (inclusive) intervals
+ *   0     to  9999 - weak password
+ *   10000 to 19999 - moderate password
+ *   20000 to 29999 - strong password
+ * 
+ * integer division of the result of psync_password_quality10000 by 10000 will give the same result as psync_password_quality()
+ * 
+ */
+
+int psync_password_quality10000(const char *password);
+
+/*
+ * Crypto functions.
+ * 
+ * psync_crypto_setup() - setups crypto with a given password, on error returns one of PSYNC_CRYPTO_SETUP_* errors
+ * psync_crypto_get_hint() - if successful sets *hint to point to a string with the user's password hint. In this case
+ *                        *hint is to be free-d. On error one of PSYNC_CRYPTO_HINT_* codes is returned and *hint is not
+ *                        set.
+ * psync_crypto_start() - starts crypto with a given password, on error returns one of PSYNC_CRYPTO_START_* errors
+ * psync_crypto_stop() - stops crypto, on error returns one of PSYNC_CRYPTO_STOP_* errors
+ * psync_crypto_isstarted() - returns 1 if crypto is started and 0 otherwise
+ * psync_crypto_mkdir() - creates encrypted folder with name in folderid. If the parent 
+ *                        folder is not encrypted itself the folder name will be stored in plaintext
+ *                        and only the contents will be encrypted. Returns 0 for success and sets *newfolderid (if newfolderid is
+ *                        non-NULL) to the id of the new folder, or non-zero on error. Negative error values are local and positive
+ *                        error  values are API error codes. If err is not null it is set to point to an static error string
+ *                        message that you do NOT have to free.
+ * psync_crypto_issetup() - returns 1 if crypto is set up or 0 otherwise
+ * psync_crypto_hassubscription() - returns 1 if the user have active payment subscription for crypto or 0 otherwise
+ * psync_crypto_isexpired() - returns 1 if the users crypto service is expired or 0 otherwise. Note that it also returns
+ *                        0 when the user never set up crypto and is therefore eligible for a trial account.
+ * psync_crypto_expires() - returns unix timestamp with the date of current crypto service expiration. The returned value
+ *                        may be in the past, meaning expired service. If crypto has never been setup for this account
+ *                        this functions returns 0.
+ * psync_crypto_reset() - reset user's crypto, which means that all encrypted files and folders get deleted. This function
+ *                        does not directly reset user's account, a confirmation email is first sent to the user.
+ * psync_crypto_folderid() - returns the id of the first encrypted folder it finds. If no encrypted folder is found the function returns
+ *                        PSYNC_CRYPTO_INVALID_FOLDERID.
+ * psync_crypto_folderids() - returns array of the ids of all encrypted folders (but not their subfolders). Last element of the array is
+ *                        always PSYNC_CRYPTO_INVALID_FOLDERID. You need to free the memory returned by this function.
+ * 
+ * 
+ */
+
+int psync_crypto_setup(const char *password, const char *hint);
+int psync_crypto_get_hint(char **hint);
+int psync_crypto_start(const char *password);
+int psync_crypto_stop();
+int psync_crypto_isstarted();
+int psync_crypto_mkdir(psync_folderid_t folderid, const char *name, const char **err, psync_folderid_t *newfolderid);
+int psync_crypto_issetup();
+int psync_crypto_hassubscription();
+int psync_crypto_isexpired();
+time_t psync_crypto_expires();
+int psync_crypto_reset();
+psync_folderid_t psync_crypto_folderid();
+psync_folderid_t *psync_crypto_folderids();
 
 #ifdef __cplusplus
 }

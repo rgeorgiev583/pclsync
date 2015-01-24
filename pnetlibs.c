@@ -102,8 +102,9 @@ static psync_socket *psync_get_api(){
 
 static void psync_ret_api(void *ptr){
   sem_post(&api_pool_sem);
-  psync_socket_close((psync_socket *)ptr);
   debug(D_NOTICE, "closing connection to api");
+  psync_socket_close((psync_socket *)ptr);
+  debug(D_NOTICE, "closed connection to api");
 }
 
 psync_socket *psync_apipool_get(){
@@ -244,7 +245,7 @@ int psync_get_remote_file_checksum(psync_fileid_t fileid, unsigned char *hexsum,
   psync_variant_row row;
   uint64_t result, h;
   binparam params[]={P_STR("auth", psync_my_auth), P_NUM("fileid", fileid)};
-  sres=psync_sql_query("SELECT h.checksum, f.size, f.hash FROM hashchecksum h, file f WHERE f.id=? AND f.hash=h.hash AND f.size=h.size");
+  sres=psync_sql_query_rdlock("SELECT h.checksum, f.size, f.hash FROM hashchecksum h, file f WHERE f.id=? AND f.hash=h.hash AND f.size=h.size");
   psync_sql_bind_uint(sres, 1, fileid);
   row=psync_sql_fetch_row(sres);
   if (row){
@@ -262,14 +263,12 @@ int psync_get_remote_file_checksum(psync_fileid_t fileid, unsigned char *hexsum,
   if (unlikely(!api))
     return PSYNC_NET_TEMPFAIL;
   res=send_command(api, "checksumfile", params);
-  if (res)
-    psync_apipool_release(api);
-  else
-    psync_apipool_release_bad(api);
   if (unlikely_log(!res)){
+    psync_apipool_release_bad(api);
     psync_timer_notify_exception();
     return PSYNC_NET_TEMPFAIL;
   }
+  psync_apipool_release(api);
   result=psync_find_result(res, "result", PARAM_NUM)->num;
   if (result){
     debug(D_ERROR, "checksumfile returned error %lu", (unsigned long)result);
@@ -301,6 +300,7 @@ int psync_get_local_file_checksum(const char *restrict filename, unsigned char *
   void *buff;
   size_t rs;
   ssize_t rrs;
+  psync_uint_t cnt;
   psync_file_t fd;
   unsigned char hashbin[PSYNC_HASH_DIGEST_LEN];
   fd=psync_file_open(filename, P_O_RDONLY, 0);
@@ -311,6 +311,7 @@ int psync_get_local_file_checksum(const char *restrict filename, unsigned char *
   buff=psync_malloc(PSYNC_COPY_BUFFER_SIZE);
   psync_hash_init(&hctx);
   rsz=psync_stat_size(&st);
+  cnt=0;
   while (rsz){
     if (rsz>PSYNC_COPY_BUFFER_SIZE)
       rs=PSYNC_COPY_BUFFER_SIZE;
@@ -321,7 +322,8 @@ int psync_get_local_file_checksum(const char *restrict filename, unsigned char *
       goto err2;
     psync_hash_update(&hctx, buff, rrs);
     rsz-=rrs;
-    psync_yield_cpu();
+    if (++cnt%16==0)
+      psync_milisleep(5);
   }
   psync_free(buff);
   psync_file_close(fd);
@@ -345,6 +347,7 @@ int psync_get_local_file_checksum_part(const char *restrict filename, unsigned c
   void *buff;
   size_t rs;
   ssize_t rrs;
+  psync_uint_t cnt;
   psync_file_t fd;
   unsigned char hashbin[PSYNC_HASH_DIGEST_LEN];
   fd=psync_file_open(filename, P_O_RDONLY, 0);
@@ -356,6 +359,7 @@ int psync_get_local_file_checksum_part(const char *restrict filename, unsigned c
   psync_hash_init(&hctx);
   psync_hash_init(&hctxp);
   rsz=psync_stat_size(&st);
+  cnt=0;
   while (rsz){
     if (rsz>PSYNC_COPY_BUFFER_SIZE)
       rs=PSYNC_COPY_BUFFER_SIZE;
@@ -376,7 +380,8 @@ int psync_get_local_file_checksum_part(const char *restrict filename, unsigned c
       }
     }
     rsz-=rrs;
-    psync_yield_cpu();
+    if (++cnt%16==0)
+      psync_milisleep(5);
   }
   psync_free(buff);
   psync_file_close(fd);
@@ -640,7 +645,7 @@ int psync_set_default_sendbuf(psync_socket *sock){
 int psync_socket_writeall_upload(psync_socket *sock, const void *buff, int num){
   psync_int_t uplspeed, writebytes, wr, wwr;
   psync_uint_t thissec;
-    uplspeed=psync_setting_get_int(_PS(maxuploadspeed));
+  uplspeed=psync_setting_get_int(_PS(maxuploadspeed));
   if (uplspeed==0){
     writebytes=0;
     while (num){
@@ -2027,7 +2032,7 @@ static int is_revision_local(const unsigned char *localhashhex, uint64_t filesiz
   // listrevisions does not return zero sized revisions, so do we
   if (filesize==0)
     return 1;
-  res=psync_sql_query("SELECT f.fileid FROM filerevision f, hashchecksum h WHERE f.fileid=? AND f.hash=h.hash AND h.size=? AND h.checksum=?");
+  res=psync_sql_query_rdlock("SELECT f.fileid FROM filerevision f, hashchecksum h WHERE f.fileid=? AND f.hash=h.hash AND h.size=? AND h.checksum=?");
   psync_sql_bind_uint(res, 1, fileid);
   psync_sql_bind_uint(res, 2, filesize);
   psync_sql_bind_lstring(res, 3, (const char *)localhashhex, PSYNC_HASH_DIGEST_HEXLEN);
@@ -2048,14 +2053,12 @@ static int download_file_revisions(psync_fileid_t fileid){
   if (unlikely(!api))
     return PSYNC_NET_TEMPFAIL;
   res=send_command(api, "listrevisions", params);
-  if (res)
-    psync_apipool_release(api);
-  else
-    psync_apipool_release_bad(api);
   if (unlikely_log(!res)){
+    psync_apipool_release_bad(api);
     psync_timer_notify_exception();
     return PSYNC_NET_TEMPFAIL;
   }
+  psync_apipool_release(api);
   result=psync_find_result(res, "result", PARAM_NUM)->num;
   if (result){
     debug(D_ERROR, "listrevisions returned error %lu", (unsigned long)result);
@@ -2142,9 +2145,12 @@ int psync_get_upload_checksum(psync_uploadid_t uploadid, unsigned char *uhash, u
   if (unlikely(!api))
     return PSYNC_NET_TEMPFAIL;
   res=send_command(api, "upload_info", params);
-  psync_apipool_release(api);
-  if (unlikely(!res))
+  if (unlikely_log(!res)){
+    psync_apipool_release_bad(api);
+    psync_timer_notify_exception();
     return PSYNC_NET_TEMPFAIL;
+  }
+  psync_apipool_release(api);
   if (psync_find_result(res, "result", PARAM_NUM)->num){
     psync_free(res);
     return PSYNC_NET_PERMFAIL;

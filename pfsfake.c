@@ -72,8 +72,15 @@ void psync_fs_refresh_folder(psync_folderid_t folderid){
 void psync_pagecache_resize_cache(){
 }
 
+int psync_cloud_crypto_setup(const char *password){
+  return PSYNC_CRYPTO_SETUP_NOT_SUPPORTED;
+}
+
 void psync_pagecache_clean_cache(){
 }
 
 void psync_fs_pause_until_login(){
+}
+
+void psync_fs_clean_tasks(){
 }

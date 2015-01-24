@@ -54,6 +54,7 @@
 #include <sys/utsname.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <netinet/tcp.h>
 #include <net/if.h>
 #include <unistd.h>
@@ -65,6 +66,12 @@
 #include <grp.h>
 
 extern char **environ;
+
+#if defined(MAP_ANONYMOUS)
+#define PSYNC_MAP_ANONYMOUS MAP_ANONYMOUS
+#elif defined(MAP_ANON)
+#define PSYNC_MAP_ANONYMOUS MAP_ANON
+#endif
 
 #elif defined(P_OS_WINDOWS)
 
@@ -188,6 +195,11 @@ void psync_compat_init(){
   limit.rlim_cur=limit.rlim_max=2048;
   if (setrlimit(RLIMIT_NOFILE, &limit))
     debug(D_ERROR, "setrlimit failed");
+#if IS_DEBUG
+  limit.rlim_cur=limit.rlim_max=RLIM_INFINITY;
+  if (setrlimit(RLIMIT_CORE, &limit))
+    debug(D_ERROR, "setrlimit failed");
+#endif
   signal(SIGPIPE, SIG_IGN);
   psync_uid=getuid();
   psync_gid=getgid();
@@ -523,6 +535,7 @@ static void psync_get_random_seed_linux(psync_lhash_ctx *hctx){
 
 static void psync_get_random_seed_from_query(psync_lhash_ctx *hctx, psync_sql_res *res){
   psync_variant_row row;
+  struct timespec tm;
   int i;
   while ((row=psync_sql_fetch_row(res))){
     for (i=0; i<res->column_count; i++)
@@ -531,30 +544,34 @@ static void psync_get_random_seed_from_query(psync_lhash_ctx *hctx, psync_sql_re
     psync_lhash_update(hctx, row, sizeof(psync_variant)*res->column_count);
   }
   psync_sql_free_result(res);
+  psync_nanotime(&tm);
+  psync_lhash_update(hctx, &tm, sizeof(&tm));
 }
 
 static void psync_get_random_seed_from_db(psync_lhash_ctx *hctx){
   psync_sql_res *res;
   struct timespec tm;
   unsigned char rnd[PSYNC_LHASH_DIGEST_LEN];
-  res=psync_sql_query("SELECT * FROM setting ORDER BY RANDOM()");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM filerevision ORDER BY RANDOM() LIMIT 50");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM file ORDER BY RANDOM() LIMIT 50");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM localfile ORDER BY RANDOM() LIMIT 50");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM resolver ORDER BY RANDOM() LIMIT 50");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM folder ORDER BY RANDOM() LIMIT 25");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM localfolder ORDER BY RANDOM() LIMIT 25");
-  psync_get_random_seed_from_query(hctx, res);
-  res=psync_sql_query("SELECT * FROM hashchecksum ORDER BY RANDOM() LIMIT 25");
-  psync_get_random_seed_from_query(hctx, res);
   psync_nanotime(&tm);
   psync_lhash_update(hctx, &tm, sizeof(&tm));
+  res=psync_sql_query_rdlock("SELECT * FROM setting ORDER BY RANDOM()");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM filerevision ORDER BY RANDOM() LIMIT 50");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM file ORDER BY RANDOM() LIMIT 50");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM localfile ORDER BY RANDOM() LIMIT 50");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM resolver ORDER BY RANDOM() LIMIT 50");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM folder ORDER BY RANDOM() LIMIT 25");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM localfolder ORDER BY RANDOM() LIMIT 25");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM hashchecksum ORDER BY RANDOM() LIMIT 25");
+  psync_get_random_seed_from_query(hctx, res);
+  res=psync_sql_query_rdlock("SELECT * FROM pagecache WHERE type=1 AND rowid>(ABS(RANDOM())%(SELECT MAX(rowid)+1 FROM pagecache)) ORDER BY rowid LIMIT 50");
+  psync_get_random_seed_from_query(hctx, res);
   psync_sql_statement("REPLACE INTO setting (id, value) VALUES ('random', RANDOM())");
   psync_nanotime(&tm);
   psync_lhash_update(hctx, &tm, sizeof(&tm));
@@ -603,7 +620,7 @@ static void psync_store_seed_in_db(const unsigned char *seed){
   psync_sql_run_free(res);
 }
 
-void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen){
+void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen, int fast){
   static unsigned char lastseed[PSYNC_LHASH_DIGEST_LEN];
   psync_lhash_ctx hctx;
   struct timespec tm;
@@ -730,9 +747,11 @@ void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen
       psync_lhash_update(&hctx, &st, sizeof(st));
     psync_free(home);
   }
-  debug(D_NOTICE, "db in");
-  psync_get_random_seed_from_db(&hctx);
-  debug(D_NOTICE, "db out");
+  if (!fast){
+    debug(D_NOTICE, "db in");
+    psync_get_random_seed_from_db(&hctx);
+    debug(D_NOTICE, "db out");
+  }
   if (aelen)
     psync_lhash_update(&hctx, addent, aelen);
   debug(D_NOTICE, "adding bulk data");
@@ -741,7 +760,7 @@ void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen
     for (j=0; j<PSYNC_LHASH_DIGEST_LEN; j++)
       lsc[i][j]^=(unsigned char)i;
   }
-  for (j=0; j<100; j++){
+  for (j=fast?98:0; j<100; j++){
     for (i=0; i<100; i++){
       psync_lhash_update(&hctx, &i, sizeof(i));
       psync_lhash_update(&hctx, &j, sizeof(j));
@@ -857,6 +876,12 @@ psync_socket_t psync_create_socket(int domain, int type, int protocol){
 static void addr_save_to_db(const char *host, const char *port, struct addrinfo *addr){
   psync_sql_res *res;
   uint64_t id;
+  if (psync_sql_isrdlocked()){
+    if (psync_sql_tryupgradelock())
+      return;
+    else
+      debug(D_NOTICE, "upgraded read to write lock to save data to DB");
+  }
   psync_sql_start_transaction();
   res=psync_sql_prep_statement("DELETE FROM resolver WHERE hostname=? AND port=?");
   psync_sql_bind_string(res, 1, host);
@@ -889,8 +914,8 @@ static struct addrinfo *addr_load_from_db(const char *host, const char *port){
   const char *str;
   uint64_t i;
   size_t len;
-  psync_sql_lock();
-  res=psync_sql_query("SELECT COUNT(*), SUM(LENGTH(data)) FROM resolver WHERE hostname=? AND port=?");
+  psync_sql_rdlock();
+  res=psync_sql_query_nolock("SELECT COUNT(*), SUM(LENGTH(data)) FROM resolver WHERE hostname=? AND port=?");
   psync_sql_bind_string(res, 1, host);
   psync_sql_bind_string(res, 2, port);
   if (!(row=psync_sql_fetch_rowint(res)) || row[0]==0){
@@ -904,7 +929,7 @@ static struct addrinfo *addr_load_from_db(const char *host, const char *port){
     ret[i].ai_next=&ret[i+1];
   ret[i].ai_next=NULL;
   psync_sql_free_result(res);
-  res=psync_sql_query("SELECT family, socktype, protocol, data FROM resolver WHERE hostname=? AND port=? ORDER BY prio");
+  res=psync_sql_query_nolock("SELECT family, socktype, protocol, data FROM resolver WHERE hostname=? AND port=? ORDER BY prio");
   psync_sql_bind_string(res, 1, host);
   psync_sql_bind_string(res, 2, port);
   i=0;
@@ -920,7 +945,7 @@ static struct addrinfo *addr_load_from_db(const char *host, const char *port){
     data+=len;
   }
   psync_sql_free_result(res);
-  psync_sql_unlock();
+  psync_sql_rdunlock();
   return ret;
 }
 
@@ -1401,7 +1426,7 @@ int psync_socket_write(psync_socket *sock, const void *buff, int num){
   else{
     r=psync_write_socket(sock->sock, buff, num);
     if (r==SOCKET_ERROR){
-      if (likely_log(psync_sock_err()==P_WOULDBLOCK || psync_sock_err()==P_AGAIN))
+      if (likely_log(psync_sock_err()==P_WOULDBLOCK || psync_sock_err()==P_AGAIN || psync_sock_err()==P_INTR))
         return 0;
       else
         return -1;
@@ -2192,8 +2217,31 @@ int psync_file_close(psync_file_t fd){
 }
 
 int psync_file_sync(psync_file_t fd){
-#if defined(P_OS_POSIX)
+#if defined(F_FULLFSYNC) && defined(P_OS_POSIX)
+  if (unlikely(fcntl(fd, F_FULLFSYNC))){
+    while (errno==EINTR){
+      debug(D_NOTICE, "got EINTR while fsyncing file");
+      if (!fcntl(fd, F_FULLFSYNC))
+        return 0;
+    }
+    debug(D_NOTICE, "got error %d, when doing fcntl(F_FULLFSYNC), trying fsync()", (int)errno);
+    if (fsync(fd)){
+      debug(D_NOTICE, "fsync also failed, error %d", (int)errno);
+      return -1;
+    }
+    else{
+      debug(D_NOTICE, "fsync succeded");
+      return 0;
+    }
+  }
+  else
+    return 0;
+#elif defined(P_OS_POSIX)
+#if _POSIX_SYNCHRONIZED_IO>0
+  if (unlikely(fdatasync(fd))){
+#else
   if (unlikely(fsync(fd))){
+#endif
     while (errno==EINTR){
       debug(D_NOTICE, "got EINTR while fsyncing file");
       if (!fsync(fd))
@@ -2206,6 +2254,94 @@ int psync_file_sync(psync_file_t fd){
     return 0;
 #elif defined(P_OS_WINDOWS)
   return psync_bool_to_zero(FlushFileBuffers(fd));
+#else
+#error "Function not implemented for your operating system"
+#endif
+}
+
+int psync_file_schedulesync(psync_file_t fd){
+#if defined(P_OS_LINUX) && defined(SYNC_FILE_RANGE_WRITE)
+  return sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+#elif defined(P_OS_POSIX) && _POSIX_MAPPED_FILES>0 && _POSIX_SYNCHRONIZED_IO>0
+  struct stat st;
+  void *fmap;
+  int ret;
+  if (unlikely(fstat(fd, &st))){
+    debug(D_NOTICE, "fstat failed, errno=%d", (int)errno);
+    return -1;
+  }
+  fmap=mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+  if (unlikely(fmap==MAP_FAILED)){
+    debug(D_NOTICE, "mmap failed, errno=%d", (int)errno);
+    return -1;
+  }
+  ret=msync(fmap, st.st_size, MS_ASYNC);
+  if (unlikely(ret))
+    debug(D_NOTICE, "msync failed, errno=%d", (int)errno);
+  munmap(fmap, st.st_size);
+  return ret;
+#elif defined(P_OS_WINDOWS)
+  HANDLE mapping;
+  void *fmap;
+  int ret;
+  ret=-1;
+  mapping=CreateFileMapping(fd, NULL, PAGE_READWRITE, 0, 0, NULL);
+  if (mapping!=NULL){
+    fmap=MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0);
+    if (fmap!=NULL){
+      if (FlushViewOfFile(fmap, 0))
+        ret=0;
+      else
+        debug(D_NOTICE, "FlushViewOfFile failed, error %u", (unsigned)GetLastError());
+      UnmapViewOfFile(fmap);
+    }
+    else
+      debug(D_NOTICE, "MapViewOfFile failed, error %u", (unsigned)GetLastError());
+    CloseHandle(mapping);
+  }
+  else
+    debug(D_NOTICE, "CreateFileMapping failed, error %u", (unsigned)GetLastError());
+  return ret;
+#else
+  return 0;
+#endif
+}
+
+int psync_folder_sync(const char *path){
+#if defined(P_OS_POSIX)
+  int fd, ret;
+  fd=open(path, O_RDONLY);
+  if (fd==-1){
+    debug(D_NOTICE, "could not open folder %s, error %d", path, (int)errno);
+    return -1;
+  }
+  if (unlikely(psync_file_sync(fd))){
+    debug(D_NOTICE, "could not fsync folder %s, error %d", path, (int)errno);
+    ret=-1;
+  }
+  else
+    ret=0;
+  close(fd);
+  return ret;
+#elif defined(P_OS_WINDOWS)
+  wchar_t *wpath;
+  HANDLE fd;
+  int ret;
+  wpath=utf8_to_wchar(path);
+  fd=CreateFileW(wpath, 0, FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+  psync_free(wpath);
+  if (fd==INVALID_HANDLE_VALUE){
+    debug(D_NOTICE, "could not open folder %s", path);
+    return -1;
+  }
+  if (FlushFileBuffers(fd))
+    ret=0;
+  else{
+    debug(D_NOTICE, "could not flush folder %s err=%u", path, GetLastError());
+    ret=-1;
+  }
+  CloseHandle(fd);
+  return ret;
 #else
 #error "Function not implemented for your operating system"
 #endif
@@ -2281,7 +2417,7 @@ ssize_t psync_file_read(psync_file_t fd, void *buf, size_t count){
   ret=read(fd, buf, count);
   if (unlikely(ret==-1)){
     while (errno==EINTR){
-      debug(D_NOTICE, "got EINTR while writing to file");
+      debug(D_NOTICE, "got EINTR while reading from file");
       ret=read(fd, buf, count);
       if (ret!=-1)
         return ret;
@@ -2413,7 +2549,7 @@ int psync_file_truncate(psync_file_t fd){
   off_t off;
   off=lseek(fd, 0, SEEK_CUR);
   if (likely_log(off!=(off_t)-1)){
-    if (unlikely_log(ftruncate(fd, off))){
+    if (unlikely(ftruncate(fd, off))){
       while (errno==EINTR){
         debug(D_NOTICE, "got EINTR while truncating file");
         if (!ftruncate(fd, off))
@@ -2672,5 +2808,34 @@ end tell\n";
   }
 #else
   return 0;
+#endif
+}
+
+void *psync_mmap_anon(size_t size){
+#if defined(PSYNC_MAP_ANONYMOUS)
+  return mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|PSYNC_MAP_ANONYMOUS, -1, 0);
+#elif defined(P_OS_WINDOWS)
+  return VirtualAlloc(NULL, size, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE);
+#else
+  return malloc(size);
+#endif
+}
+
+int psync_munmap_anon(void *ptr, size_t size){
+#if defined(PSYNC_MAP_ANONYMOUS)
+  return munmap(ptr, size);
+#elif defined(P_OS_WINDOWS)
+  return psync_bool_to_zero(VirtualFree(ptr, 0, MEM_RELEASE));
+#else
+  free(ptr);
+  return 0;
+#endif
+}
+
+void psync_anon_reset(void *ptr, size_t size){
+#if defined(PSYNC_MAP_ANONYMOUS) && defined(MADV_DONTNEED)
+  madvise(ptr, size, MADV_DONTNEED);
+#elif defined(P_OS_WINDOWS)
+  VirtualAlloc(ptr, size, MEM_RESET, PAGE_READWRITE);
 #endif
 }

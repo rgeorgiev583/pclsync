@@ -48,6 +48,27 @@ typedef struct _psync_tree {
                                                      &a->n!=NULL;\
                                                      a=psync_tree_element(psync_tree_get_next(&a->n), t, n))
 
+#define psync_tree_for_each_element_call(l, t, n, c)\
+  do {\
+    psync_tree *___tmpa;\
+    ___tmpa=psync_tree_get_first(l);\
+    while (___tmpa){\
+      c(psync_tree_element(___tmpa, t, n));\
+      ___tmpa=psync_tree_get_next(___tmpa);\
+    }\
+  } while (0)
+  
+#define psync_tree_for_each_element_call_safe(l, t, n, c)\
+  do {\
+    psync_tree *___tmpa, *___tmpb;\
+    ___tmpa=psync_tree_get_first_safe(l);\
+    while (___tmpa){\
+      ___tmpb=psync_tree_get_next_safe(___tmpa);\
+      c(psync_tree_element(___tmpa, t, n));\
+      ___tmpa=___tmpb;\
+    }\
+  } while (0)
+
 
 typedef int (*psync_tree_compare)(const psync_tree *, const psync_tree *);
 
@@ -97,6 +118,37 @@ static inline psync_tree *psync_tree_get_prev(psync_tree *tree){
       tree=tree->parent;
     return tree->parent;
   }
+}
+
+static inline psync_tree *psync_tree_get_first_safe(psync_tree *tree){
+  if (!tree)
+    return tree;
+  while (1){
+    if (tree->left)
+      tree=tree->left;
+    else if (tree->right)
+      tree=tree->right;
+    else
+      break;
+  }
+  return tree;
+}
+
+static inline psync_tree *psync_tree_get_next_safe(psync_tree *tree){
+  if (!tree->parent)
+    return NULL;
+  if (tree->parent->right==tree || tree->parent->right==NULL)
+    return tree->parent;
+  tree=tree->parent->right;
+  while (1){
+    if (tree->left)
+      tree=tree->left;
+    else if (tree->right)
+      tree=tree->right;
+    else
+      break;
+  }
+  return tree;
 }
 
 psync_tree *psync_tree_get_add_after(psync_tree *tree, psync_tree *node, psync_tree *newnode);

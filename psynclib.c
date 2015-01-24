@@ -48,7 +48,9 @@
 #include "plocalnotify.h"
 #include "pcache.h"
 #include "pfileops.h"
+#include "pcloudcrypto.h"
 #include "ppagecache.h"
+#include "ppassword.h"
 #include <string.h>
 #include <ctype.h>
 #include <stddef.h>
@@ -66,6 +68,7 @@ static void *debug_malloc(size_t sz){
   void *ptr;
   if (unlikely(sz>=PSYNC_DEBUG_LOG_ALLOC_OVER))
     debug(D_WARNING, "allocating %lu bytes", (unsigned long)sz);
+  assert(sz>0);
   ptr=psync_real_malloc(sz);
   if (likely_log(ptr))
     memset(ptr, 0xfa, sz);
@@ -107,6 +110,13 @@ void psync_set_alloc(psync_malloc_t malloc_call, psync_realloc_t realloc_call, p
   psync_free=free_call;
 }
 
+static void psync_stop_crypto_on_sleep(){
+  if (psync_setting_get_bool(_PS(sleepstopcrypto)) && psync_crypto_isstarted()){
+    psync_cloud_crypto_stop();
+    debug(D_NOTICE, "stopped crypto due to sleep");
+  }
+}
+
 int psync_init(){
   psync_thread_name="main app thread";
   if (IS_DEBUG){
@@ -142,6 +152,7 @@ int psync_init(){
   psync_libs_init();
   psync_settings_init();
   psync_status_init();
+  psync_timer_sleep_handler(psync_stop_crypto_on_sleep);
   if (IS_DEBUG){
     psync_libstate=1;
     pthread_mutex_unlock(&psync_libstate_mutex);
@@ -199,7 +210,7 @@ void psync_destroy(){
 }
 
 void psync_get_status(pstatus_t *status){
-  memcpy(status, &psync_status, sizeof(pstatus_t));
+  psync_callbacks_get_status(status);
 }
 
 char *psync_get_username(){
@@ -290,6 +301,7 @@ void psync_logout(){
   psync_sql_statement("DELETE FROM setting WHERE id IN ('pass', 'auth', 'saveauth')");
   psync_invalidate_auth(psync_my_auth);
   memset(psync_my_auth, 0, sizeof(psync_my_auth));
+  psync_cloud_crypto_stop();
   pthread_mutex_lock(&psync_my_auth_mutex);
   psync_free(psync_my_pass);
   psync_my_pass=NULL;
@@ -315,6 +327,7 @@ void psync_unlink(){
   psync_status_recalc_to_download();
   psync_status_recalc_to_upload();
   psync_invalidate_auth(psync_my_auth);
+  psync_cloud_crypto_stop();
   psync_milisleep(20);
   psync_stop_localscan();
   psync_sql_checkpoint_lock();
@@ -381,6 +394,7 @@ void psync_unlink(){
   pthread_mutex_unlock(&psync_my_auth_mutex);
   debug(D_NOTICE, "clearing database, finished");
   psync_fs_pause_until_login();
+  psync_fs_clean_tasks();
   psync_sql_unlock();
   psync_sql_checkpoint_unlock();
   psync_settings_reset();
@@ -870,7 +884,7 @@ int psync_has_value(const char *valuename){
   psync_sql_res *res;
   psync_uint_row row;
   int ret;
-  res=psync_sql_query("SELECT COUNT(*) FROM setting WHERE id=?");
+  res=psync_sql_query_rdlock("SELECT COUNT(*) FROM setting WHERE id=?");
   psync_sql_bind_string(res, 1, valuename);
   row=psync_sql_fetch_rowint(res);
   if (row)
@@ -901,7 +915,7 @@ uint64_t psync_get_uint_value(const char *valuename){
   psync_sql_res *res;
   psync_uint_row row;
   uint64_t ret;
-  res=psync_sql_query("SELECT value FROM setting WHERE id=?");
+  res=psync_sql_query_rdlock("SELECT value FROM setting WHERE id=?");
   psync_sql_bind_string(res, 1, valuename);
   row=psync_sql_fetch_rowint(res);
   if (row)
@@ -924,7 +938,7 @@ char *psync_get_string_value(const char *valuename){
   psync_sql_res *res;
   psync_str_row row;
   char *ret;
-  res=psync_sql_query("SELECT value FROM setting WHERE id=?");
+  res=psync_sql_query_rdlock("SELECT value FROM setting WHERE id=?");
   psync_sql_bind_string(res, 1, valuename);
   row=psync_sql_fetch_rowstr(res);
   if (row)
@@ -985,7 +999,7 @@ psync_sharerequest_list_t *psync_list_sharerequests(int incoming){
   psync_sql_res *res;
   builder=psync_list_builder_create(sizeof(psync_sharerequest_t), offsetof(psync_sharerequest_list_t, sharerequests));
   incoming=!!incoming;
-  res=psync_sql_query("SELECT id, folderid, ctime, permissions, userid, mail, name, message FROM sharerequest WHERE isincoming=? ORDER BY name");
+  res=psync_sql_query_rdlock("SELECT id, folderid, ctime, permissions, userid, mail, name, message FROM sharerequest WHERE isincoming=? ORDER BY name");
   psync_sql_bind_uint(res, 1, incoming);
   psync_list_bulder_add_sql(builder, res, create_request);
   return (psync_sharerequest_list_t *)psync_list_builder_finalize(builder);
@@ -1021,7 +1035,7 @@ psync_share_list_t *psync_list_shares(int incoming){
   psync_sql_res *res;
   builder=psync_list_builder_create(sizeof(psync_share_t), offsetof(psync_share_list_t, shares));
   incoming=!!incoming;
-  res=psync_sql_query("SELECT id, folderid, ctime, permissions, userid, mail, name FROM sharedfolder WHERE isincoming=? ORDER BY name");
+  res=psync_sql_query_rdlock("SELECT id, folderid, ctime, permissions, userid, mail, name FROM sharedfolder WHERE isincoming=? ORDER BY name");
   psync_sql_bind_uint(res, 1, incoming);
   psync_list_bulder_add_sql(builder, res, create_share);
   return (psync_share_list_t *)psync_list_builder_finalize(builder);
@@ -1166,9 +1180,23 @@ psync_new_version_t *psync_check_new_version(const char *os, unsigned long curre
   return ver;
 }
 
+static void psync_del_all_except(void *ptr, psync_pstat_fast *st){
+  const char **nmarr;
+  char *fp;
+  nmarr=(const char **)ptr;
+  if (!psync_filename_cmp(st->name, nmarr[1]) || st->isfolder)
+    return;
+  fp=psync_strcat(nmarr[0], PSYNC_DIRECTORY_SEPARATOR, st->name, NULL);
+  debug(D_NOTICE, "deleting old update file %s", fp);
+  if (psync_file_delete(fp))
+    debug(D_WARNING, "could not delete %s", fp);
+  psync_free(fp);
+}
+
 static char *psync_filename_from_res(const binresult *res){
   const char *nm;
   char *nmd, *path, *ret;
+  const char *nmarr[2];
   nm=strrchr(psync_find_result(res, "path", PARAM_STR)->str, '/');
   if (unlikely_log(!nm))
     return NULL;
@@ -1176,6 +1204,9 @@ static char *psync_filename_from_res(const binresult *res){
   if (unlikely_log(!path))
     return NULL;
   nmd=psync_url_decode(nm+1);
+  nmarr[0]=path;
+  nmarr[1]=nmd;
+  psync_list_dir_fast(path, psync_del_all_except, (void *)nmarr);
   ret=psync_strcat(path, PSYNC_DIRECTORY_SEPARATOR, nmd, NULL);
   psync_free(nmd);
   psync_free(path);
@@ -1284,5 +1315,124 @@ void psync_run_new_version(psync_new_version_t *ver){
     return;
   psync_destroy();
   exit(0);
+}
+
+int psync_password_quality(const char *password){
+  uint64_t score=psync_password_score(password);
+  if (score<(uint64_t)1<<30)
+    return 0;
+  if (score<(uint64_t)1<<40)
+    return 1;
+  else
+    return 2;
+}
+
+int psync_password_quality10000(const char *password){
+  uint64_t score=psync_password_score(password);
+  if (score<(uint64_t)1<<30)
+    return score/(((uint64_t)1<<30)/10000+1);
+  if (score<(uint64_t)1<<40)
+    return (score-((uint64_t)1<<30))/((((uint64_t)1<<40)-((uint64_t)1<<30))/10000+1)+10000;
+  else{
+    if (score>=((uint64_t)1<<45)-((uint64_t)1<<40))
+      return 29999;
+    else
+      return (score-((uint64_t)1<<40))/((((uint64_t)1<<45)-((uint64_t)1<<40))/10000+1)+20000;
+  }
+}
+
+int psync_crypto_setup(const char *password, const char *hint){
+  if (psync_status_is_offline())
+    return PSYNC_CRYPTO_SETUP_CANT_CONNECT;
+  else
+    return psync_cloud_crypto_setup(password, hint);
+}
+
+int psync_crypto_get_hint(char **hint){
+  if (psync_status_is_offline())
+    return PSYNC_CRYPTO_HINT_CANT_CONNECT;
+  else
+    return psync_cloud_crypto_get_hint(hint);
+}
+
+int psync_crypto_start(const char *password){
+  return psync_cloud_crypto_start(password);
+}
+
+int psync_crypto_stop(){
+  return psync_cloud_crypto_stop();
+}
+
+int psync_crypto_isstarted(){
+  return psync_cloud_crypto_isstarted();
+}
+
+int psync_crypto_mkdir(psync_folderid_t folderid, const char *name, const char **err, psync_folderid_t *newfolderid){
+  if (psync_status_is_offline())
+    return PSYNC_CRYPTO_CANT_CONNECT;
+  else
+    return psync_cloud_crypto_mkdir(folderid, name, err, newfolderid);
+}
+
+int psync_crypto_issetup(){
+  return psync_sql_cellint("SELECT value FROM setting WHERE id='cryptosetup'", 0);
+}
+
+int psync_crypto_hassubscription(){
+  return psync_sql_cellint("SELECT value FROM setting WHERE id='cryptosubscription'", 0);
+}
+
+int psync_crypto_isexpired(){
+  int64_t ce;
+  ce=psync_sql_cellint("SELECT value FROM setting WHERE id='cryptoexpires'", 0);
+  return ce?(ce<psync_timer_time()):0;
+}
+
+time_t psync_crypto_expires(){
+  return psync_sql_cellint("SELECT value FROM setting WHERE id='cryptoexpires'", 0);
+}
+
+int psync_crypto_reset(){
+  if (psync_status_is_offline())
+    return PSYNC_CRYPTO_RESET_CANT_CONNECT;
+  else
+    return psync_cloud_crypto_reset();
+}
+
+psync_folderid_t psync_crypto_folderid(){
+  int64_t id;
+  id=psync_sql_cellint("SELECT id FROM folder WHERE parentfolderid=0 AND flags&"NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)"="NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)" LIMIT 1", 0);
+  if (id)
+    return id;
+  id=psync_sql_cellint("SELECT f1.id FROM folder f1, folder f2 WHERE f1.parentfolderid=f2.id AND "
+                       "f1.flags&"NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)"="NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)" AND "
+                       "f2.flags&"NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)"=0 LIMIT 1", 0);
+  if (id)
+    return id;
+  else
+    return PSYNC_CRYPTO_INVALID_FOLDERID;
+}
+
+psync_folderid_t *psync_crypto_folderids(){
+  psync_sql_res *res;
+  psync_uint_row row;
+  psync_folderid_t *ret;
+  size_t alloc, l;
+  alloc=2;
+  l=0;
+  ret=psync_new_cnt(psync_folderid_t, alloc);
+  res=psync_sql_query_rdlock("SELECT f1.id FROM folder f1, folder f2 WHERE f1.parentfolderid=f2.id AND "
+                             "f1.flags&"NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)"="NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)" AND "
+                             "f2.flags&"NTO_STR(PSYNC_FOLDER_FLAG_ENCRYPTED)"=0");
+  while ((row=psync_sql_fetch_rowint(res))){
+    ret[l]=row[0];
+    if (++l==alloc){
+      alloc*=2;
+      ret=(psync_folderid_t *)psync_realloc(ret, sizeof(psync_folderid_t)*alloc);
+    }
+  }
+  psync_sql_free_result(res);
+  ret[l]=PSYNC_CRYPTO_INVALID_FOLDERID;
+  return ret;
 }
 

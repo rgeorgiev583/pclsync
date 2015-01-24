@@ -25,28 +25,11 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _PSYNC_FSFOLDER_H
-#define _PSYNC_FSFOLDER_H
+#ifndef _PSYNC_PASSWORD_H
+#define _PSYNC_PASSWORD_H
 
 #include <stdint.h>
-#include <time.h>
 
-typedef int64_t psync_fsfolderid_t;
-typedef int64_t psync_fsfileid_t;
-
-#define PSYNC_INVALID_FSFOLDERID INT64_MIN
-
-typedef struct {
-  psync_fsfolderid_t folderid;
-  const char *name;
-  uint32_t shareid;
-  uint16_t permissions;
-  uint16_t flags;
-} psync_fspath_t;
-
-psync_fspath_t *psync_fsfolder_resolve_path(const char *path);
-psync_fsfolderid_t psync_fsfolderid_by_path(const char *path, uint32_t *pflags);
-int psync_fsfolder_crypto_error();
-
+uint64_t psync_password_score(const char *password);
 
 #endif

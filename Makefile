@@ -3,7 +3,9 @@ AR=ar rcu
 RANLIB=ranlib
 USESSL=openssl
 
-CFLAGS=-Wall -Wpointer-arith -g -O2
+#CFLAGS=-Wall -Wpointer-arith -O2 -g -fsanitize=address -mtune=core2
+CFLAGS=-Wall -Wpointer-arith -O2 -g -fno-stack-protector -mtune=core2
+#CFLAGS=-O2 -g -pg
 
 LIB_A=psynclib.a
 
@@ -31,11 +33,11 @@ else
     endif
 endif
 
-OBJ=pcompat.o psynclib.o plibs.o pcallbacks.o pdiff.o pstatus.o papi.o ptimer.o pupload.o pdownload.o pfolder.o\
+OBJ=pcompat.o psynclib.o plocks.o plibs.o pcallbacks.o pdiff.o pstatus.o papi.o ptimer.o pupload.o pdownload.o pfolder.o\
      psyncer.o ptasks.o psettings.o pnetlibs.o pcache.o pscanner.o plist.o plocalscan.o plocalnotify.o pp2p.o\
-     pcrypto.o pssl.o pfileops.o ptree.o
+     pcrypto.o pssl.o pfileops.o ptree.o ppassword.o
 
-OBJFS=pfs.o ppagecache.o pfsfolder.o pfstasks.o pfsupload.o pintervaltree.o pfsxattr.o
+OBJFS=pfs.o ppagecache.o pfsfolder.o pfstasks.o pfsupload.o pintervaltree.o pfsxattr.o pcloudcrypto.o pfscrypto.o pcrc32c.o pfsstatic.o plocks.o
 
 OBJNOFS=pfsfake.o
 

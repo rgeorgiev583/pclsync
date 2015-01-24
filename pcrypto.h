@@ -30,8 +30,20 @@
 
 #include "pssl.h"
 
-#define PSYNC_AES256_SECTOR_SIZE 4096
-#define PSYNC_AES256_ENC_SECTOR_SIZE (PSYNC_AES256_SECTOR_SIZE+PSYNC_AES256_BLOCK_SIZE)
+#define PSYNC_CRYPTO_AUTH_SIZE (PSYNC_AES256_BLOCK_SIZE*2)
+
+#define PSYNC_CRYPTO_MAX_HASH_TREE_LEVEL 6
+
+typedef struct {
+  uint64_t masterauthoff;
+  uint64_t plainsize;
+  uint64_t lastauthsectoroff[PSYNC_CRYPTO_MAX_HASH_TREE_LEVEL];
+  uint16_t lastauthsectorlen[PSYNC_CRYPTO_MAX_HASH_TREE_LEVEL];
+  uint8_t treelevels;
+  uint8_t needmasterauth;
+} psync_crypto_offsets_t;
+
+typedef unsigned char psync_crypto_sector_auth_t[PSYNC_CRYPTO_AUTH_SIZE];
 
 typedef struct {
   psync_aes256_encoder encoder;
@@ -41,19 +53,27 @@ typedef struct {
   };
 } psync_crypto_aes256_key_struct_t, *psync_crypto_aes256_ctr_encoder_decoder_t;
 
-typedef psync_crypto_aes256_ctr_encoder_decoder_t psync_crypto_aes256_text_encoder_t;
-typedef psync_crypto_aes256_ctr_encoder_decoder_t psync_crypto_aes256_text_decoder_t;
+typedef struct {
+  psync_aes256_encoder encoder;
+  unsigned long ivlen;
+  unsigned char iv[];
+} psync_crypto_aes256_key_var_iv_struct_t, *psync_crypto_aes256_text_encoder_t, *psync_crypto_aes256_text_decoder_t;
 
-typedef psync_crypto_aes256_ctr_encoder_decoder_t psync_crypto_aes256_sector_encoder_decoder_t;
+
+typedef struct {
+  psync_aes256_encoder encoder;
+  psync_aes256_decoder decoder;
+  unsigned long ivlen;
+  unsigned char iv[];
+} psync_crypto_aes256_enc_dec_var_iv_struct_t, *psync_crypto_aes256_sector_encoder_decoder_t;
 
 #define psync_crypto_aes256_text_gen_key psync_crypto_aes256_ctr_gen_key
 #define psync_crypto_aes256_sector_gen_key psync_crypto_aes256_ctr_gen_key
 
-#define psync_crypto_aes256_sector_encoder_decoder_create psync_crypto_aes256_ctr_encoder_decoder_create
-#define psync_crypto_aes256_sector_encoder_decoder_free psync_crypto_aes256_ctr_encoder_decoder_free
-
 #define PSYNC_CRYPTO_INVALID_ENCODER NULL
+#define PSYNC_CRYPTO_INVALID_REVISIONID ((uint32_t)-1)
 
+psync_symmetric_key_t psync_crypto_aes256_gen_key_len(size_t len);
 psync_symmetric_key_t psync_crypto_aes256_ctr_gen_key();
 psync_crypto_aes256_ctr_encoder_decoder_t psync_crypto_aes256_ctr_encoder_decoder_create(psync_symmetric_key_t key);
 void psync_crypto_aes256_ctr_encoder_decoder_free(psync_crypto_aes256_ctr_encoder_decoder_t enc);
@@ -66,9 +86,11 @@ void psync_crypto_aes256_text_decoder_free(psync_crypto_aes256_text_decoder_t en
 void psync_crypto_aes256_encode_text(psync_crypto_aes256_text_encoder_t enc, const unsigned char *txt, size_t txtlen, unsigned char **out, size_t *outlen);
 unsigned char *psync_crypto_aes256_decode_text(psync_crypto_aes256_text_decoder_t enc, const unsigned char *data, size_t datalen);
 
+psync_crypto_aes256_sector_encoder_decoder_t psync_crypto_aes256_sector_encoder_decoder_create(psync_symmetric_key_t key);
+void psync_crypto_aes256_sector_encoder_decoder_free(psync_crypto_aes256_sector_encoder_decoder_t enc);
 void psync_crypto_aes256_encode_sector(psync_crypto_aes256_sector_encoder_decoder_t enc, const unsigned char *data, size_t datalen, 
-                                       unsigned char *out, uint64_t sectorid, uint32_t revisionid);
+                                       unsigned char *out, psync_crypto_sector_auth_t authout, uint64_t sectorid);
 int psync_crypto_aes256_decode_sector(psync_crypto_aes256_sector_encoder_decoder_t enc, const unsigned char *data, size_t datalen, 
-                                       unsigned char *out, uint64_t sectorid, uint32_t *revisionid);
-
+                                       unsigned char *out, const psync_crypto_sector_auth_t auth, uint64_t sectorid);
+void psync_crypto_sign_auth_sector(psync_crypto_aes256_sector_encoder_decoder_t enc, const unsigned char *data, size_t datalen, psync_crypto_sector_auth_t authout);
 #endif

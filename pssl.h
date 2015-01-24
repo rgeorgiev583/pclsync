@@ -31,6 +31,9 @@
 #include "pcompiler.h"
 #include "pcompat.h"
 
+#define PSYNC_AES256_BLOCK_SIZE 16
+#define PSYNC_AES256_KEY_SIZE 32
+
 #if defined(P_SSL_OPENSSL)
 #include "pssl-openssl.h"
 #elif defined(P_SSL_SECURETRANSPORT)
@@ -62,9 +65,6 @@ typedef psync_encrypted_data_t psync_binary_rsa_key_t;
 #define PSYNC_INVALID_ENCODER NULL
 #define PSYNC_INVALID_BIN_RSA NULL
 
-#define PSYNC_AES256_BLOCK_SIZE 16
-#define PSYNC_AES256_KEY_SIZE 32
-
 #define psync_ssl_alloc_binary_rsa psync_ssl_alloc_encrypted_symmetric_key
 
 int psync_ssl_init();
@@ -73,7 +73,7 @@ int psync_ssl_connect(psync_socket_t sock, void **sslconn, const char *hostname)
 int psync_ssl_connect_finish(void *sslconn, const char *hostname);
 void psync_ssl_free(void *sslconn);
 int psync_ssl_shutdown(void *sslconn);
-int psync_ssl_pendingdata(void *sslconn) PSYNC_PURE;
+int psync_ssl_pendingdata(void *sslconn);
 int psync_ssl_read(void *sslconn, void *buf, int num);
 int psync_ssl_write(void *sslconn, const void *buf, int num);
 
@@ -88,14 +88,19 @@ psync_rsa_privatekey_t psync_ssl_rsa_get_private(psync_rsa_t rsa);
 void psync_ssl_rsa_free_private(psync_rsa_privatekey_t key);
 psync_binary_rsa_key_t psync_ssl_rsa_public_to_binary(psync_rsa_publickey_t rsa);
 psync_binary_rsa_key_t psync_ssl_rsa_private_to_binary(psync_rsa_privatekey_t rsa);
+psync_rsa_publickey_t psync_ssl_rsa_load_public(const unsigned char *keydata, size_t keylen);
+psync_rsa_privatekey_t psync_ssl_rsa_load_private(const unsigned char *keydata, size_t keylen);
 psync_rsa_publickey_t psync_ssl_rsa_binary_to_public(psync_binary_rsa_key_t bin);
 psync_rsa_privatekey_t psync_ssl_rsa_binary_to_private(psync_binary_rsa_key_t bin);
 void psync_ssl_rsa_free_binary(psync_binary_rsa_key_t bin);
 
-psync_symmetric_key_t psync_ssl_gen_symmetric_key_from_pass(const char *password, size_t keylen, const char *salt, size_t saltlen);
+psync_symmetric_key_t psync_ssl_gen_symmetric_key_from_pass(const char *password, size_t keylen, const unsigned char *salt, size_t saltlen, size_t iterations);
 psync_encrypted_symmetric_key_t psync_ssl_alloc_encrypted_symmetric_key(size_t len);
+psync_encrypted_symmetric_key_t psync_ssl_copy_encrypted_symmetric_key(psync_encrypted_symmetric_key_t src);
 void psync_ssl_free_symmetric_key(psync_symmetric_key_t key);
 
+psync_encrypted_symmetric_key_t psync_ssl_rsa_encrypt_data(psync_rsa_publickey_t rsa, const unsigned char *data, size_t datalen);
+psync_symmetric_key_t psync_ssl_rsa_decrypt_data(psync_rsa_privatekey_t rsa, const unsigned char *data, size_t datalen);
 psync_encrypted_symmetric_key_t psync_ssl_rsa_encrypt_symmetric_key(psync_rsa_publickey_t rsa, const psync_symmetric_key_t key);
 psync_symmetric_key_t psync_ssl_rsa_decrypt_symmetric_key(psync_rsa_privatekey_t rsa, const psync_encrypted_symmetric_key_t enckey);
 

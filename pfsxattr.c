@@ -9,6 +9,12 @@
 #include <errno.h>
 #include <string.h>
 
+#if IS_DEBUG
+#define psync_fs_set_thread_name() do {psync_thread_name=__FUNCTION__;} while (0)
+#else
+#define psync_fs_set_thread_name() do {} while (0)
+#endif
+
 // Do we have this in Win?
 #if !defined(P_OS_WINDOWS)
 #include <sys/xattr.h>
@@ -32,14 +38,16 @@ enum
 #define ENOATTR ENODATA
 #endif
 
-#define OBJECT_MULTIPLIER 8
-#define OBJECT_FOLDER 0
-#define OBJECT_FILE   1
-#define OBJECT_TASK   2
+#define OBJECT_MULTIPLIER   8
+#define OBJECT_FOLDER       0
+#define OBJECT_FILE         1
+#define OBJECT_TASK         2
+#define OBJECT_STATICFILE   3
 
 #define folderid_to_objid(id) ((id)*OBJECT_MULTIPLIER+OBJECT_FOLDER)
 #define fileid_to_objid(id) ((id)*OBJECT_MULTIPLIER+OBJECT_FILE)
 #define taskid_to_objid(id) ((id)*OBJECT_MULTIPLIER+OBJECT_TASK)
+#define static_taskid_to_objid(id) ((UINT64_MAX-id+1)*OBJECT_MULTIPLIER+OBJECT_STATICFILE)
 
 static void delete_object_id(uint64_t oid){
   psync_sql_res *res;
@@ -76,6 +84,14 @@ void psync_fs_task_to_folder(uint64_t taskid, psync_folderid_t folderid){
   update_object_id(taskid_to_objid(taskid), folderid_to_objid(folderid));
 }
 
+void psync_fs_static_to_task(uint64_t statictaskid, uint64_t taskid){
+  update_object_id(static_taskid_to_objid(statictaskid), taskid_to_objid(taskid));
+}
+
+void psync_fs_file_to_task(psync_fileid_t fileid, uint64_t taskid){
+  update_object_id(fileid_to_objid(fileid), taskid_to_objid(taskid));
+}
+
 static int64_t xattr_get_object_id_locked(const char *path){
   psync_fspath_t *fspath;
   psync_fstask_folder_t *folder;
@@ -94,7 +110,7 @@ static int64_t xattr_get_object_id_locked(const char *path){
   }
   checkfile=1;
   checkfolder=1;
-  folder=psync_fstask_get_folder_tasks_locked(fspath->folderid);
+  folder=psync_fstask_get_folder_tasks_rdlocked(fspath->folderid);
   if (folder){
     mk=psync_fstask_find_mkdir(folder, fspath->name, 0);
     if (mk){
@@ -110,8 +126,10 @@ static int64_t xattr_get_object_id_locked(const char *path){
       psync_free(fspath);
       if (cr->fileid>0)
         return fileid_to_objid(cr->fileid);
+      else if (cr->fileid==0)
+        return static_taskid_to_objid(cr->taskid);
       else{
-        res=psync_sql_query("SELECT type, fileid FROM fstask WHERE id=?");
+        res=psync_sql_query_nolock("SELECT type, fileid FROM fstask WHERE id=?");
         psync_sql_bind_uint(res, 1, -cr->fileid);
         if ((row=psync_sql_fetch_rowint(res))){
           if (row[0]==PSYNC_FS_TASK_CREAT)
@@ -131,7 +149,6 @@ static int64_t xattr_get_object_id_locked(const char *path){
     }
     checkfolder=!psync_fstask_find_rmdir(folder, fspath->name, 0);
     checkfile=!psync_fstask_find_unlink(folder, fspath->name, 0);
-    psync_fstask_release_folder_tasks_locked(folder);
   }
   if (fspath->folderid<0){
     psync_free(fspath);
@@ -139,7 +156,7 @@ static int64_t xattr_get_object_id_locked(const char *path){
     return -1;
   }
   if (checkfolder){
-    res=psync_sql_query("SELECT id FROM folder WHERE parentfolderid=? AND name=?");
+    res=psync_sql_query_nolock("SELECT id FROM folder WHERE parentfolderid=? AND name=?");
     psync_sql_bind_uint(res, 1, fspath->folderid);
     psync_sql_bind_string(res, 2, fspath->name);
     if ((row=psync_sql_fetch_rowint(res)))
@@ -153,7 +170,7 @@ static int64_t xattr_get_object_id_locked(const char *path){
     }
   }
   if (checkfile){
-    res=psync_sql_query("SELECT id FROM file WHERE parentfolderid=? AND name=?");
+    res=psync_sql_query_nolock("SELECT id FROM file WHERE parentfolderid=? AND name=?");
     psync_sql_bind_uint(res, 1, fspath->folderid);
     psync_sql_bind_string(res, 2, fspath->name);
     if ((row=psync_sql_fetch_rowint(res)))
@@ -176,7 +193,16 @@ static int64_t xattr_get_object_id_locked(const char *path){
   oid=xattr_get_object_id_locked(path);\
   if (unlikely(oid==-1)){\
     psync_sql_unlock();\
-    return -ENOENT;\
+    return -PRINT_RETURN_CONST(ENOENT);\
+  }\
+} while (0)
+
+#define LOCK_AND_LOOKUPRD() do {\
+  psync_sql_rdlock();\
+  oid=xattr_get_object_id_locked(path);\
+  if (unlikely(oid==-1)){\
+    psync_sql_rdunlock();\
+    return -PRINT_RETURN_CONST(ENOENT);\
   }\
 } while (0)
 
@@ -184,6 +210,7 @@ int psync_fs_setxattr(const char *path, const char *name, const char *value, siz
   psync_sql_res *res;
   int64_t oid;
   int ret;
+  psync_fs_set_thread_name();
   LOCK_AND_LOOKUP();
   if (flags&XATTR_CREATE){
     res=psync_sql_prep_statement("INSERT OR IGNORE INTO fsxattr (objectid, name, value) VALUES (?, ?, ?)");
@@ -216,19 +243,20 @@ int psync_fs_setxattr(const char *path, const char *name, const char *value, siz
     ret=0;
   }
   psync_sql_unlock();
-  return ret;
+  return PRINT_NEG_RETURN(ret);
 }
 
 int psync_fs_getxattr(const char *path, const char *name, char *value, size_t size PFS_XATTR_IGN){
   psync_sql_res *res;
   int64_t oid;
   int ret;
-  LOCK_AND_LOOKUP();
+  psync_fs_set_thread_name();
+  LOCK_AND_LOOKUPRD();
   if (size && value){
     psync_variant_row row;
     const char *str;
     size_t len;
-    res=psync_sql_query("SELECT value FROM fsxattr WHERE objectid=? AND name=?");
+    res=psync_sql_query_nolock("SELECT value FROM fsxattr WHERE objectid=? AND name=?");
     psync_sql_bind_uint(res, 1, oid);
     psync_sql_bind_string(res, 2, name);
     if ((row=psync_sql_fetch_row(res))){
@@ -251,7 +279,7 @@ int psync_fs_getxattr(const char *path, const char *name, char *value, size_t si
   }
   else{
     psync_uint_row row;
-    res=psync_sql_query("SELECT LENGTH(value) FROM fsxattr WHERE objectid=? AND name=?");
+    res=psync_sql_query_nolock("SELECT LENGTH(value) FROM fsxattr WHERE objectid=? AND name=?");
     psync_sql_bind_uint(res, 1, oid);
     psync_sql_bind_string(res, 2, name);
     if ((row=psync_sql_fetch_rowint(res))){
@@ -264,7 +292,7 @@ int psync_fs_getxattr(const char *path, const char *name, char *value, size_t si
     }
     psync_sql_free_result(res);
   }
-  psync_sql_unlock();
+  psync_sql_rdunlock();
   return ret;
 }
 
@@ -274,11 +302,12 @@ int psync_fs_listxattr(const char *path, char *list, size_t size){
   const char *str;
   size_t len;
   int ret;
-  LOCK_AND_LOOKUP();
+  psync_fs_set_thread_name();
+  LOCK_AND_LOOKUPRD();
   if (size && list){
     psync_variant_row row;
     ret=0;
-    res=psync_sql_query("SELECT name FROM fsxattr WHERE objectid=?");
+    res=psync_sql_query_nolock("SELECT name FROM fsxattr WHERE objectid=?");
     psync_sql_bind_uint(res, 1, oid);
     while ((row=psync_sql_fetch_row(res))){
       str=psync_get_lstring(row[0], &len);
@@ -295,7 +324,7 @@ int psync_fs_listxattr(const char *path, char *list, size_t size){
   }
   else{
     psync_uint_row row;
-    res=psync_sql_query("SELECT SUM(LENGTH(name)+1) FROM fsxattr WHERE objectid=?");
+    res=psync_sql_query_nolock("SELECT SUM(LENGTH(name)+1) FROM fsxattr WHERE objectid=?");
     psync_sql_bind_uint(res, 1, oid);
     if ((row=psync_sql_fetch_rowint(res)))
       ret=row[0];
@@ -304,7 +333,7 @@ int psync_fs_listxattr(const char *path, char *list, size_t size){
     psync_sql_free_result(res);
     debug(D_NOTICE, "returning length of attributes of %s = %d", path, ret);
   }
-  psync_sql_unlock();
+  psync_sql_rdunlock();
   return ret;
 }
 
@@ -312,6 +341,7 @@ int psync_fs_removexattr(const char *path, const char *name){
   psync_sql_res *res;
   int64_t oid;
   uint32_t aff;
+  psync_fs_set_thread_name();
   LOCK_AND_LOOKUP();
   res=psync_sql_prep_statement("DELETE FROM fsxattr WHERE objectid=? AND name=?");
   psync_sql_bind_uint(res, 1, oid);

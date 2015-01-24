@@ -74,25 +74,30 @@
 #endif
 
 #if defined(P_OS_WINDOWS)
-#define P_OS_ID 5
-#elif defined(P_OS_MACOSX)
-#define P_OS_ID 6
-#elif defined(P_OS_LINUX)
-#define P_OS_ID 7
-#else
-#define P_OS_ID 0
-#endif
 
-#ifdef P_OS_WINDOWS
+#define P_OS_ID 5
 
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0501
 #endif
 
-#endif
 
-#if defined(P_OS_MACOSX)
+#elif defined(P_OS_MACOSX)
+
+#define P_OS_ID 6
+
 #define _DARWIN_USE_64_BIT_INODE
+
+#elif defined(P_OS_LINUX)
+
+#define P_OS_ID 7
+
+#define _GNU_SOURCE
+
+#else
+
+#define P_OS_ID 0
+
 #endif
 
 #define _FILE_OFFSET_BITS 64
@@ -133,6 +138,7 @@ typedef unsigned long psync_uint_t;
 #include <unistd.h>
 
 #define P_PRI_U64 PRIu64
+#define P_PRI_D64 PRId64
 
 #define psync_stat stat
 #define psync_fstat fstat
@@ -227,16 +233,22 @@ typedef int psync_file_t;
 #include <ws2tcpip.h>
 #include <winsock2.h>
 #include <BaseTsd.h>
-#if defined(__GNUC__)
-#define psync_def_var_arr(name, type, size) type name[size]
-#define P_PRI_U64 "I64u"
-#else
-#include <malloc.h>
-#define psync_def_var_arr(name, type, size) type *name = (type *)alloca(sizeof(type)*size)
-#define P_PRI_U64 "llu"
 
+#define P_PRI_U64 "I64u"
+#define P_PRI_D64 "I64d"
+
+#if defined(__GNUC__)
+
+#define psync_def_var_arr(name, type, size) type name[size]
+
+#else
+
+#include <malloc.h>
+
+#define psync_def_var_arr(name, type, size) type *name=(type *)alloca(sizeof(type)*(size))
 #define atoll _atoi64
 #define snprintf _snprintf
+
 #endif
 
 #if !defined(_SSIZE_T_) && !defined(_SSIZE_T_DEFINED)
@@ -394,7 +406,7 @@ time_t psync_time();
 void psync_nanotime(struct timespec *tm);
 void psync_yield_cpu();
 
-void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen);
+void psync_get_random_seed(unsigned char *seed, const void *addent, size_t aelen, int fast);
 
 psync_socket_t psync_create_socket(int domain, int type, int protocol);
 psync_socket *psync_socket_connect(const char *host, int unsigned port, int ssl);
@@ -443,6 +455,8 @@ int psync_file_delete(const char *path);
 psync_file_t psync_file_open(const char *path, int access, int flags);
 int psync_file_close(psync_file_t fd);
 int psync_file_sync(psync_file_t fd);
+int psync_file_schedulesync(psync_file_t fd);
+int psync_folder_sync(const char *path);
 psync_file_t psync_file_dup(psync_file_t fd);
 int psync_file_preread(psync_file_t fd, uint64_t offset, size_t count);
 int psync_file_readahead(psync_file_t fd, uint64_t offset, size_t count);
@@ -452,7 +466,7 @@ ssize_t psync_file_write(psync_file_t fd, const void *buf, size_t count);
 ssize_t psync_file_pwrite(psync_file_t fd, const void *buf, size_t count, uint64_t offset);
 int64_t psync_file_seek(psync_file_t fd, uint64_t offset, int whence);
 int psync_file_truncate(psync_file_t fd);
-int64_t psync_file_size(psync_file_t fd) PSYNC_PURE;
+int64_t psync_file_size(psync_file_t fd);
 char *psync_deviceid();
 
 #if defined(P_OS_WINDOWS) && !defined(gmtime_r)
@@ -462,5 +476,9 @@ struct tm *gmtime_r(const time_t *timep, struct tm *result);
 int psync_run_update_file(const char *path);
 int psync_invalidate_os_cache_needed();
 int psync_invalidate_os_cache(const char *path);
+
+void *psync_mmap_anon(size_t size);
+int psync_munmap_anon(void *ptr, size_t size);
+void psync_anon_reset(void *ptr, size_t size);
 
 #endif

@@ -1,5 +1,5 @@
-/* Copyright (c) 2014 Anton Titov.
- * Copyright (c) 2014 pCloud Ltd.
+/* Copyright (c) 2015 Anton Titov.
+ * Copyright (c) 2015 pCloud Ltd.
  * All rights reserved.
  * 
  * Redistribution and use in source and binary forms, with or without
@@ -25,28 +25,36 @@
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _PSYNC_FSFOLDER_H
-#define _PSYNC_FSFOLDER_H
+#ifndef _PSYNC_LOCKS_H
+#define _PSYNC_LOCKS_H
 
-#include <stdint.h>
-#include <time.h>
-
-typedef int64_t psync_fsfolderid_t;
-typedef int64_t psync_fsfileid_t;
-
-#define PSYNC_INVALID_FSFOLDERID INT64_MIN
+#include <pthread.h>
 
 typedef struct {
-  psync_fsfolderid_t folderid;
-  const char *name;
-  uint32_t shareid;
-  uint16_t permissions;
-  uint16_t flags;
-} psync_fspath_t;
+  unsigned rcount;
+  unsigned rwait;
+  unsigned wcount;
+  unsigned wwait;
+  unsigned opts;
+  pthread_key_t cntkey;
+  pthread_mutex_t mutex;
+  pthread_cond_t rcond;
+  pthread_cond_t wcond;
+} psync_rwlock_t;
 
-psync_fspath_t *psync_fsfolder_resolve_path(const char *path);
-psync_fsfolderid_t psync_fsfolderid_by_path(const char *path, uint32_t *pflags);
-int psync_fsfolder_crypto_error();
-
+void psync_rwlock_init(psync_rwlock_t *rw);
+void psync_rwlock_destroy(psync_rwlock_t *rw);
+void psync_rwlock_rdlock(psync_rwlock_t *rw);
+int psync_rwlock_tryrdlock(psync_rwlock_t *rw);
+int psync_rwlock_timedrdlock(psync_rwlock_t *rw, const struct timespec *abstime);
+void psync_rwlock_rdlock_starvewr(psync_rwlock_t *rw);
+void psync_rwlock_wrlock(psync_rwlock_t *rw);
+int psync_rwlock_trywrlock(psync_rwlock_t *rw);
+int psync_rwlock_timedwrlock(psync_rwlock_t *rw, const struct timespec *abstime);
+void psync_rwlock_rslock(psync_rwlock_t *rw);
+int psync_rwlock_towrlock(psync_rwlock_t *rw);
+void psync_rwlock_unlock(psync_rwlock_t *rw);
+unsigned psync_rwlock_num_waiters(psync_rwlock_t *rw);
+int psync_rwlock_holding_rdlock(psync_rwlock_t *rw);
 
 #endif
